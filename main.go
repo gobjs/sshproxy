@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -55,7 +54,38 @@ func sessionAuthenticate(key, secret string) error {
 }
 
 func sessionInfoRequest() (*sessInfo, error) {
-	return nil, errors.New("not implemented")
+	return sessInfoFromEnv(), nil
+	//return nil, errors.New("not implemented")
+}
+
+func sessInfoFromEnv() *sessInfo {
+	user, ok := os.LookupEnv("SSHPROXY_USER")
+	if !ok {
+		user = "root"
+	}
+	host, ok := os.LookupEnv("SSHPROXY_HOST")
+	if !ok {
+		user = "localhost"
+	}
+	portStr, ok := os.LookupEnv("SSHPROXY_PORT")
+	if !ok {
+		portStr = "22"
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		port = 22
+	}
+	password, ok := os.LookupEnv("SSHPROXY_PASSWORD")
+	if !ok {
+		user = "111111"
+	}
+
+	return &sessInfo{
+		User:     user,
+		Host:     host,
+		Port:     port,
+		Password: password,
+	}
 }
 
 func sshServerConn(cc net.Conn) (*ServerConn, error) {
@@ -92,11 +122,7 @@ func sshServerConn(cc net.Conn) (*ServerConn, error) {
 }
 
 func readHostKey() (ssh.Signer, error) {
-	priBytes, err := os.ReadFile("server.key")
-	if err != nil {
-		return nil, fmt.Errorf("read hostkey file failed: %v", err)
-	}
-	priHostKey, err := ssh.ParsePrivateKey(priBytes)
+	priHostKey, err := ssh.ParsePrivateKey(serverKeyPem)
 	if err != nil {
 		return nil, fmt.Errorf("parse hostkey failed: %v", err)
 	}
