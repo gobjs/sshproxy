@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/binary"
 	"fmt"
 	"io"
 	"net"
@@ -175,11 +176,13 @@ type Session struct {
 	reqs <-chan *ssh.Request
 	envs []string
 
-	ptmx    *os.File
-	tty     *os.File
-	started bool
+	ptyRequestMsg ptyRequestMsg
+	ptmx          *os.File
+	tty           *os.File
+	started       bool
 
-	sessInfo *sessInfo
+	sessInfo     *sessInfo
+	proxySession *ssh.Session
 }
 
 type sessInfo struct {
@@ -202,6 +205,8 @@ func (s *Session) serve(ctx context.Context) {
 			go s.handleShellReq(ctx, req)
 		case "env":
 			s.handleEnvReq(ctx, req)
+		case "window-change":
+			s.handleWindowChangeReq(ctx, req)
 		default:
 			req.Reply(false, []byte(fmt.Sprintf("unknown req %q", req.Type)))
 		}
@@ -209,9 +214,6 @@ func (s *Session) serve(ctx context.Context) {
 }
 
 func (s *Session) handleShellReq(ctx context.Context, req *ssh.Request) {
-	s.mux.Lock()
-	defer s.mux.Unlock()
-
 	defer s.ch.Close()
 
 	s.started = true
@@ -253,11 +255,23 @@ func (s *Session) handleShellReq(ctx context.Context, req *ssh.Request) {
 		logger.Warn("open session failed", zap.Error(err))
 		return
 	}
+	s.proxySession = session
 
-	err = session.RequestPty("xterm", 24, 80, ssh.TerminalModes{
-		ssh.ECHO:    1,
-		ssh.ECHOCTL: 0,
-	})
+	modes := make(ssh.TerminalModes)
+	modesBytes := []byte(s.ptyRequestMsg.Modelist)
+	for {
+		opcode := modesBytes[0]
+		if opcode == 0 {
+			break
+		}
+
+		argument := binary.BigEndian.Uint32(modesBytes[1:5])
+		logger.Debug("modes", zap.Uint8("opcode", opcode), zap.Uint32("value", argument))
+
+		modes[opcode] = argument
+		modesBytes = modesBytes[5:]
+	}
+	err = session.RequestPty(s.ptyRequestMsg.Term, int(s.ptyRequestMsg.Rows), int(s.ptyRequestMsg.Columns), modes)
 	if err != nil {
 		logger.Warn("request pty failed", zap.Error(err))
 		return
@@ -318,6 +332,15 @@ func (s *Session) handleShellReq(ctx context.Context, req *ssh.Request) {
 	s.ch.SendRequest("exit-status", false, ssh.Marshal(struct{ Code uint32 }{Code: 0}))
 }
 
+type ptyRequestMsg struct {
+	Term     string
+	Columns  uint32
+	Rows     uint32
+	Width    uint32
+	Height   uint32
+	Modelist string
+}
+
 func (s *Session) handlePtyReq(ctx context.Context, req *ssh.Request) {
 	s.mux.Lock()
 	defer s.mux.Unlock()
@@ -327,7 +350,12 @@ func (s *Session) handlePtyReq(ctx context.Context, req *ssh.Request) {
 		return
 	}
 
-	var err error
+	err := ssh.Unmarshal(req.Payload, &s.ptyRequestMsg)
+	if err != nil {
+		logger.Warn("unmarshal pty request failed", zap.Error(err))
+		return
+	}
+
 	s.ptmx, s.tty, err = pty.Open()
 	if err != nil {
 		req.Reply(false, nil)
@@ -358,6 +386,25 @@ func (s *Session) handleEnvReq(ctx context.Context, req *ssh.Request) {
 	}
 	s.envs = append(s.envs, fmt.Sprintf("%s=%s", payload.Key, payload.Value))
 	req.Reply(true, nil)
+}
+
+type ptyWindowChangeMsg struct {
+	Columns uint32
+	Rows    uint32
+	Width   uint32
+	Height  uint32
+}
+
+func (s *Session) handleWindowChangeReq(ctx context.Context, req *ssh.Request) {
+	s.mux.Lock()
+	defer s.mux.Unlock()
+
+	var msg ptyWindowChangeMsg
+	ssh.Unmarshal(req.Payload, &msg)
+	logger.Debug("window changed", zap.Uint32("rows", msg.Rows), zap.Uint32("cols", msg.Columns))
+	if s.proxySession != nil {
+		s.proxySession.SendRequest("window-change", false, req.Payload)
+	}
 }
 
 func handleSessionChannel(nch ssh.NewChannel) (*Session, error) {
